@@ -1,0 +1,195 @@
+# Kubexer fork: build the RDP web package and publish it as a GitHub release tarball.
+#
+# Produces `@kubexer/iron-remote-desktop-rdp`, a drop-in replacement for
+# `@devolutions/iron-remote-desktop-rdp`, built with upstream's own build path
+# (`npm run build` in web-client/iron-remote-desktop-rdp, which runs `cargo xtask web build`).
+#
+# - Tag `v<upstream base>-kx.<n>` (e.g. `v0.7.0-kx.1`) builds, packs and creates a GitHub release
+#   with the tarball and its npm integrity hash.
+# - workflow_dispatch only builds and uploads the tarball as a workflow artifact (no release).
+
+name: Kubexer release
+
+on:
+  push:
+    tags:
+      - 'v*-kx.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (default: <upstream base>-kx.0-dev.<run number>). No release is created.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kubexer-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Matches xtask/src/bin_version.rs (WASM_PACK).
+  WASM_PACK_VERSION: '0.15.0'
+  PACKAGE_NAME: '@kubexer/iron-remote-desktop-rdp'
+  PACKAGE_DIR: web-client/iron-remote-desktop-rdp
+
+jobs:
+  release:
+    name: Build and release iron-remote-desktop-rdp
+    if: github.repository == 'SamerX/Kubexer-IronRDP'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Install Rust (toolchain from rust-toolchain.toml) and wasm target
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+        shell: bash
+
+      - name: Install wasm-pack
+        run: cargo install --locked "wasm-pack@${WASM_PACK_VERSION}"
+        shell: bash
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          base=$(node -p "require('./${PACKAGE_DIR}/public/package.json').version")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-kx\.[0-9]+$ ]]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} must look like v<major>.<minor>.<patch>-kx.<n>"
+              exit 1
+            fi
+            if [ "${version%%-kx.*}" != "$base" ]; then
+              echo "::error::Tag base ${version%%-kx.*} does not match upstream package version ${base} (${PACKAGE_DIR}/public/package.json)"
+              exit 1
+            fi
+          elif [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION#v}"
+          else
+            version="${base}-kx.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "Upstream base: ${base}; package version: ${version}"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # Same path as upstream's npm-publish.yml. `cargo xtask web build` (run by `pre-build`) also
+      # builds iron-svelte-client, so its dependencies are installed too.
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          for dir in web-client/iron-remote-desktop web-client/iron-remote-desktop-rdp web-client/iron-svelte-client; do
+            (cd "$dir" && npm ci)
+          done
+        shell: bash
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          rm -rf crates/ironrdp-web/pkg "${PACKAGE_DIR}/dist"
+          (cd "${PACKAGE_DIR}" && npm run build)
+          # pre-build.js only logs errors, so check that the wasm was really built.
+          test -s crates/ironrdp-web/pkg/ironrdp_web_bg.wasm
+          test -s "${PACKAGE_DIR}/dist/iron-remote-desktop-rdp.js"
+          test -s "${PACKAGE_DIR}/dist/index.d.ts"
+        shell: bash
+
+      - name: Rewrite package.json, add license files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dist="${PACKAGE_DIR}/dist"
+          cp LICENSE-MIT LICENSE-APACHE "$dist/"
+          node - "$dist/package.json" <<'EOF'
+          const fs = require('fs');
+          const file = process.argv[2];
+          const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+          pkg.name = process.env.PACKAGE_NAME;
+          pkg.version = process.env.VERSION;
+          pkg.repository = { type: 'git', url: `git+https://github.com/${process.env.GITHUB_REPOSITORY}.git` };
+          pkg.homepage = `https://github.com/${process.env.GITHUB_REPOSITORY}`;
+          pkg.bugs = { url: `https://github.com/${process.env.GITHUB_REPOSITORY}/issues` };
+          pkg.files = [...new Set([...(pkg.files ?? []), 'LICENSE-MIT', 'LICENSE-APACHE'])];
+          fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+          EOF
+          cat "$dist/package.json"
+        shell: bash
+
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          (cd "${PACKAGE_DIR}/dist" && npm pack --json --pack-destination "${GITHUB_WORKSPACE}/out") > out/pack.json
+          tarball=$(node -p "require('./out/pack.json')[0].filename")
+          integrity=$(node -p "require('./out/pack.json')[0].integrity")
+          computed="sha512-$(openssl dgst -sha512 -binary "out/${tarball}" | base64 -w0)"
+          if [ "$integrity" != "$computed" ]; then
+            echo "::error::Integrity mismatch: npm=${integrity} openssl=${computed}"
+            exit 1
+          fi
+          tar -tzf "out/${tarball}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "integrity=${integrity}" >> "$GITHUB_OUTPUT"
+          echo "Packed ${tarball}: ${integrity}"
+        shell: bash
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.pack.outputs.tarball }}
+          path: out/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          INTEGRITY: ${{ steps.pack.outputs.integrity }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BASE: ${{ steps.version.outputs.base }}
+        run: |
+          set -euo pipefail
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${TARBALL}"
+          cat > out/notes.md <<EOF
+          \`${PACKAGE_NAME}@${VERSION}\`, built from [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}) (upstream IronRDP web package base \`${BASE}\`).
+
+          | | |
+          |---|---|
+          | Tarball | \`${TARBALL}\` |
+          | Integrity | \`${INTEGRITY}\` |
+
+          Install:
+
+          \`\`\`sh
+          npm install ${url}
+          \`\`\`
+
+          package-lock entry: \`"resolved": "${url}"\`, \`"integrity": "${INTEGRITY}"\`
+          EOF
+          gh release create "${GITHUB_REF_NAME}" "out/${TARBALL}" \
+            --verify-tag \
+            --title "${PACKAGE_NAME}@${VERSION}" \
+            --notes-file out/notes.md
+        shell: bash
