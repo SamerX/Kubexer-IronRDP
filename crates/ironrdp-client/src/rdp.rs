@@ -1248,37 +1248,37 @@ impl RdpClient {
                 Transport::Gateway(gw) | Transport::GatewayRpch(gw) => {
                     let gw = gw.clone();
                     let use_rpch = matches!(&self.config.transport, Transport::GatewayRpch(_));
-                    let connect_result = if gw.prefer_direct {
-                        let direct_config = self.config.clone();
-                        let gateway_connect = async {
-                            if use_rpch {
-                                connect_gateway_rpch(
-                                    &self.config,
-                                    &gw,
-                                    &self.input_event_sender,
-                                    &self.output_event_sender,
-                                    cliprdr_factory,
-                                    rdpdr_factory,
-                                    reconnect_cookie,
-                                )
-                                .await
-                            } else {
-                                connect_gateway(
-                                    &mut self.config,
-                                    &gw,
-                                    &self.input_event_sender,
-                                    &self.output_event_sender,
-                                    cliprdr_factory,
-                                    rdpdr_factory,
-                                    reconnect_cookie,
-                                )
-                                .await
-                            }
-                        };
+                    let direct_config = gw.prefer_direct.then(|| self.config.clone());
+                    let gateway_connect = async {
+                        if use_rpch {
+                            connect_gateway_rpch(
+                                &self.config,
+                                &gw,
+                                &self.input_event_sender,
+                                &self.output_event_sender,
+                                cliprdr_factory,
+                                rdpdr_factory,
+                                reconnect_cookie,
+                            )
+                            .await
+                        } else {
+                            connect_gateway(
+                                &mut self.config,
+                                &gw,
+                                &self.input_event_sender,
+                                &self.output_event_sender,
+                                cliprdr_factory,
+                                rdpdr_factory,
+                                reconnect_cookie,
+                            )
+                            .await
+                        }
+                    };
+                    let connect_result = if let Some(direct_config) = &direct_config {
                         Box::pin(connect_preferring_direct(
                             &mut self.close_receiver,
                             connect_direct(
-                                &direct_config,
+                                direct_config,
                                 &self.input_event_sender,
                                 &self.output_event_sender,
                                 cliprdr_factory,
@@ -1289,31 +1289,6 @@ impl RdpClient {
                         ))
                         .await
                     } else {
-                        let gateway_connect = async {
-                            if use_rpch {
-                                connect_gateway_rpch(
-                                    &self.config,
-                                    &gw,
-                                    &self.input_event_sender,
-                                    &self.output_event_sender,
-                                    cliprdr_factory,
-                                    rdpdr_factory,
-                                    reconnect_cookie,
-                                )
-                                .await
-                            } else {
-                                connect_gateway(
-                                    &mut self.config,
-                                    &gw,
-                                    &self.input_event_sender,
-                                    &self.output_event_sender,
-                                    cliprdr_factory,
-                                    rdpdr_factory,
-                                    reconnect_cookie,
-                                )
-                                .await
-                            }
-                        };
                         Box::pin(cancelable_operation(gateway_connect, &mut self.close_receiver)).await
                     };
 

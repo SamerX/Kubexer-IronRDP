@@ -1,4 +1,7 @@
 //! Azure Virtual Desktop (AVD) connection orchestration, WAM token acquisition, and WebSocket gateway transport.
+//!
+//! Orchestration and challenge parsers in this module are property-tested in `ironrdp-testsuite-extra`
+//! rather than fuzzed in `ironrdp-fuzzing`, which does not depend on `ironrdp-client`.
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -109,12 +112,16 @@ pub struct OAuthAvdTokenProvider {
 }
 
 impl OAuthAvdTokenProvider {
-    /// Create a new cross-platform OAuth2 AVD token provider with the default per-user token cache.
+    /// Create a new cross-platform OAuth2 AVD token provider using in-memory refresh-token caching
+    /// (or the path in `IRONRDP_AVD_TOKEN_CACHE` when explicitly set).
     pub fn new(mode: AvdOAuthMode) -> anyhow::Result<Self> {
         Self::with_cache_path(mode, default_token_cache_path())
     }
 
     /// Create a new cross-platform OAuth2 AVD token provider with an explicit cache file path (or `None` for in-memory only).
+    ///
+    /// When `cache_path` is `Some`, refresh tokens are persisted as plaintext JSON at that path (with `0600`
+    /// owner-only permissions on Unix). Pass `None` to keep refresh tokens strictly in memory.
     pub fn with_cache_path(mode: AvdOAuthMode, cache_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let http = crate::http_client_builder()
             .context("configure AVD OAuth2 HTTP client")?
@@ -219,8 +226,8 @@ impl OAuthAvdTokenProvider {
                 .await
             {
                 Ok(resp) => resp,
-                Err(pkce_err) => {
-                    debug!(%pkce_err, "Loopback PKCE flow unavailable; falling back to OAuth2 Device Code flow");
+                Err(error) => {
+                    debug!(%error, "Loopback PKCE flow unavailable; falling back to OAuth2 Device Code flow");
                     self.acquire_via_device_code(&authority, &challenge.client_id, &scope, claims)
                         .await?
                 }
@@ -275,12 +282,20 @@ impl OAuthAvdTokenProvider {
         )
     }
 
+    /// Look up a cached refresh token for `(authority, client_id, username_hint)`.
+    ///
+    /// Gateway authentication (`allow_cross_tenant_host_exchange == false`) requires an exact `authority`
+    /// match (and an exact `username_hint` match when non-empty).
+    ///
+    /// Host PoP token minting (`allow_cross_tenant_host_exchange == true`) may redeem a multi-resource
+    /// refresh token acquired against `/common` (or the user's home tenant) at the orchestration-returned
+    /// `/{deviceTenantId}` endpoint on the same validated Entra login host for the same `client_id` and account.
     fn lookup_cached_refresh_token(
         &self,
         authority: &str,
         client_id: &str,
         username_hint: Option<&str>,
-        allow_unattributed_host_fallback: bool,
+        allow_cross_tenant_host_exchange: bool,
     ) -> Option<(Zeroizing<String>, String)> {
         let guard = self.memory_cache.lock().ok()?;
         let hint = username_hint.map(str::trim).filter(|s| !s.is_empty());
@@ -293,6 +308,9 @@ impl OAuthAvdTokenProvider {
         let authority_lower = authority.to_ascii_lowercase();
 
         if let Some(hint) = hint {
+            if !allow_cross_tenant_host_exchange {
+                return None;
+            }
             let hint_lower = hint.to_ascii_lowercase();
             if let Some((_, v)) = guard.iter().find(|(k, _)| {
                 let mut parts = k.splitn(3, '|');
@@ -307,30 +325,27 @@ impl OAuthAvdTokenProvider {
             }) {
                 return Some(v.clone());
             }
-            if allow_unattributed_host_fallback {
-                return guard
-                    .iter()
-                    .find(|(k, _)| {
-                        let mut parts = k.splitn(3, '|');
-                        let (Some(entry_auth), Some(entry_client), Some(entry_user)) =
-                            (parts.next(), parts.next(), parts.next())
-                        else {
-                            return false;
-                        };
-                        entry_client == client_lower
-                            && entry_user.is_empty()
-                            && authority_host(entry_auth).as_deref() == Some(target_host.as_str())
-                    })
-                    .map(|(_, v)| v.clone());
-            }
-            return None;
+            return guard
+                .iter()
+                .find(|(k, _)| {
+                    let mut parts = k.splitn(3, '|');
+                    let (Some(entry_auth), Some(entry_client), Some(entry_user)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        return false;
+                    };
+                    entry_client == client_lower
+                        && entry_user.is_empty()
+                        && authority_host(entry_auth).as_deref() == Some(target_host.as_str())
+                })
+                .map(|(_, v)| v.clone());
         }
 
         let same_authority_prefix = format!("{authority_lower}|{client_lower}|");
         if let Some((_, v)) = guard.iter().find(|(k, _)| k.starts_with(&same_authority_prefix)) {
             return Some(v.clone());
         }
-        if allow_unattributed_host_fallback {
+        if allow_cross_tenant_host_exchange {
             return guard
                 .iter()
                 .find(|(k, _)| {
@@ -356,8 +371,9 @@ impl OAuthAvdTokenProvider {
         authority: &str,
         client_id: &str,
         username_hint: Option<&str>,
+        allow_cross_tenant_host_exchange: bool,
     ) -> Option<(String, String)> {
-        self.lookup_cached_refresh_token(authority, client_id, username_hint, false)
+        self.lookup_cached_refresh_token(authority, client_id, username_hint, allow_cross_tenant_host_exchange)
             .map(|(rt, u)| ((*rt).clone(), u))
     }
 
@@ -373,6 +389,46 @@ impl OAuthAvdTokenProvider {
                 save_token_cache_file(path, &guard);
             }
         }
+    }
+
+    async fn post_token_request(
+        &self,
+        authority: &str,
+        form_body: &str,
+        context_msg: &'static str,
+    ) -> anyhow::Result<OAuthTokenResponse> {
+        let (status, bytes) = self.send_token_form(authority, form_body, context_msg).await?;
+        ensure!(
+            status.is_success(),
+            "OAuth2 token endpoint returned HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        Self::parse_token_response(&bytes)
+    }
+
+    async fn send_token_form(
+        &self,
+        authority: &str,
+        form_body: &str,
+        context_msg: &'static str,
+    ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
+        let resp = self
+            .http
+            .post(format!("{authority}/oauth2/v2.0/token"))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form_body.as_bytes().to_vec())
+            .send()
+            .await
+            .context(context_msg)?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.context("read OAuth2 token response")?;
+        Ok((status, bytes.to_vec()))
+    }
+
+    fn parse_token_response(bytes: &[u8]) -> anyhow::Result<OAuthTokenResponse> {
+        let parsed: OAuthTokenResponse = serde_json::from_slice(bytes).context("decode OAuth2 token response JSON")?;
+        ensure!(!parsed.access_token.is_empty(), "OAuth2 returned an empty access_token");
+        Ok(parsed)
     }
 
     async fn exchange_refresh_token(
@@ -396,24 +452,8 @@ impl OAuthAvdTokenProvider {
             form.append_pair("req_cnf", req_cnf).append_pair("token_type", "pop");
         }
         let body = Zeroizing::new(form.finish());
-        let resp = self
-            .http
-            .post(format!("{authority}/oauth2/v2.0/token"))
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(body.as_bytes().to_vec())
-            .send()
+        self.post_token_request(authority, &body, "send OAuth2 refresh_token request")
             .await
-            .context("send OAuth2 refresh_token request")?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.context("read OAuth2 token response")?;
-        ensure!(
-            status.is_success(),
-            "OAuth2 token endpoint returned HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let parsed: OAuthTokenResponse = serde_json::from_slice(&bytes).context("decode OAuth2 token response JSON")?;
-        ensure!(!parsed.access_token.is_empty(), "OAuth2 returned an empty access_token");
-        Ok(parsed)
     }
 
     async fn acquire_via_loopback_pkce(
@@ -544,24 +584,8 @@ impl OAuthAvdTokenProvider {
             form.append_pair("claims", claims);
         }
         let body = Zeroizing::new(form.finish());
-        let resp = self
-            .http
-            .post(format!("{authority}/oauth2/v2.0/token"))
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(body.as_bytes().to_vec())
-            .send()
+        self.post_token_request(authority, &body, "exchange OAuth2 authorization code")
             .await
-            .context("exchange OAuth2 authorization code")?;
-        let status = resp.status();
-        let bytes = resp.bytes().await?;
-        ensure!(
-            status.is_success(),
-            "OAuth2 code exchange returned HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let parsed: OAuthTokenResponse = serde_json::from_slice(&bytes)?;
-        ensure!(!parsed.access_token.is_empty(), "OAuth2 returned an empty access_token");
-        Ok(parsed)
     }
 
     async fn acquire_via_device_code(
@@ -618,23 +642,12 @@ impl OAuthAvdTokenProvider {
             if let Some(claims) = claims {
                 poll_form.append_pair("claims", claims);
             }
-
-            let poll_resp = self
-                .http
-                .post(format!("{authority}/oauth2/v2.0/token"))
-                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(poll_form.finish().into_bytes())
-                .send()
-                .await
-                .context("poll OAuth2 devicecode token endpoint")?;
-
-            let poll_status = poll_resp.status();
-            let poll_bytes = poll_resp.bytes().await?;
+            let poll_body = poll_form.finish();
+            let (poll_status, poll_bytes) = self
+                .send_token_form(authority, &poll_body, "poll OAuth2 devicecode token endpoint")
+                .await?;
             if poll_status.is_success() {
-                let token: OAuthTokenResponse =
-                    serde_json::from_slice(&poll_bytes).context("decode OAuth2 token response")?;
-                ensure!(!token.access_token.is_empty(), "OAuth2 returned an empty access_token");
-                return Ok(token);
+                return Self::parse_token_response(&poll_bytes);
             }
 
             if let Ok(err) = serde_json::from_slice::<OAuthErrorResponse>(&poll_bytes) {
@@ -714,6 +727,11 @@ pub struct AvdIceServer {
     pub credential: Option<String>,
 }
 
+/// Parsed `WWW-Authenticate: Claims:...` challenge parameters from an AVD orchestration gateway.
+///
+/// See [RFC 7235] section 4.1 ("WWW-Authenticate").
+///
+/// [RFC 7235]: https://datatracker.ietf.org/doc/html/rfc7235#section-4.1
 #[doc(hidden)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ClaimsChallenge {
@@ -724,6 +742,11 @@ pub struct ClaimsChallenge {
 }
 
 impl ClaimsChallenge {
+    /// Parses a `Claims:Authority=...;Client=...;Resource=...;Site=...` challenge header value.
+    ///
+    /// See [RFC 7235] section 4.1 ("WWW-Authenticate").
+    ///
+    /// [RFC 7235]: https://datatracker.ietf.org/doc/html/rfc7235#section-4.1
     #[doc(hidden)]
     pub fn parse(header_val: &str) -> Option<Self> {
         let rest = header_val
@@ -991,7 +1014,7 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
 
     let username_hint = match &config.connector.credentials {
         Credentials::UsernamePassword { username, .. } if !username.is_empty() => Some(username.clone()),
-        _ => gw.username.as_str().into_non_empty().map(str::to_owned),
+        _ => (!gw.username.is_empty()).then(|| gw.username.clone()),
     };
 
     let gw_challenge = AvdGatewayChallenge {
@@ -1018,14 +1041,9 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
         tokio::task::spawn_blocking(move || provider.acquire_gateway_token(&gw_challenge_clone))
             .await
             .context("join custom AVD gateway token provider")??
-    } else if let Some(mode) = oauth_mode {
-        let provider = OAuthAvdTokenProvider::new(mode)?;
-        let res = provider.acquire_gateway_token_async(&gw_challenge).await?;
-        oauth_provider = Some(provider);
-        res
     } else {
         #[cfg(windows)]
-        {
+        let wam_result = if oauth_mode.is_none() {
             match acquire_gateway_token_via_wam(
                 gw_challenge.authority.clone(),
                 gw_challenge.client_id.clone(),
@@ -1035,19 +1053,22 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
             )
             .await
             {
-                Ok(res) => res,
-                Err(wam_err) => {
-                    warn!(%wam_err, "WAM gateway token acquisition unavailable; falling back to cross-platform OAuth2 provider");
-                    let provider = OAuthAvdTokenProvider::new(AvdOAuthMode::Auto)?;
-                    let res = provider.acquire_gateway_token_async(&gw_challenge).await?;
-                    oauth_provider = Some(provider);
-                    res
+                Ok(res) => Some(res),
+                Err(error) => {
+                    warn!(%error, "WAM gateway token acquisition unavailable; falling back to cross-platform OAuth2 provider");
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
         #[cfg(not(windows))]
-        {
-            let provider = OAuthAvdTokenProvider::new(AvdOAuthMode::Auto)?;
+        let wam_result: Option<(String, String)> = None;
+
+        if let Some(res) = wam_result {
+            res
+        } else {
+            let provider = OAuthAvdTokenProvider::new(oauth_mode.unwrap_or_default())?;
             let res = provider.acquire_gateway_token_async(&gw_challenge).await?;
             oauth_provider = Some(provider);
             res
@@ -1192,26 +1213,27 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
             provider.acquire_host_pop_token_async(&pop_req).await?
         } else {
             #[cfg(windows)]
+            let wam_pop = match acquire_aadj_pop_token_via_wam(
+                pop_req.authority.clone(),
+                pop_req.client_id.clone(),
+                pop_req.resource_uri.clone(),
+                pop_req.req_cnf.clone(),
+                pop_req.username_hint.clone(),
+            )
+            .await
             {
-                match acquire_aadj_pop_token_via_wam(
-                    pop_req.authority.clone(),
-                    pop_req.client_id.clone(),
-                    pop_req.resource_uri.clone(),
-                    pop_req.req_cnf.clone(),
-                    pop_req.username_hint.clone(),
-                )
-                .await
-                {
-                    Ok(tok) => tok,
-                    Err(wam_err) => {
-                        warn!(%wam_err, "WAM host PoP token acquisition unavailable; falling back to cross-platform OAuth2 provider");
-                        let provider = OAuthAvdTokenProvider::new(oauth_mode.unwrap_or_default())?;
-                        provider.acquire_host_pop_token_async(&pop_req).await?
-                    }
+                Ok(tok) => Some(tok),
+                Err(error) => {
+                    warn!(%error, "WAM host PoP token acquisition unavailable; falling back to cross-platform OAuth2 provider");
+                    None
                 }
-            }
+            };
             #[cfg(not(windows))]
-            {
+            let wam_pop: Option<String> = None;
+
+            if let Some(tok) = wam_pop {
+                tok
+            } else {
                 let provider = OAuthAvdTokenProvider::new(oauth_mode.unwrap_or_default())?;
                 provider.acquire_host_pop_token_async(&pop_req).await?
             }
@@ -1236,20 +1258,16 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
     })
 }
 
-trait StrExt {
-    fn into_non_empty(self) -> Option<Self>
-    where
-        Self: Sized;
-}
-
-impl StrExt for &str {
-    fn into_non_empty(self) -> Option<Self> {
-        (!self.is_empty()).then_some(self)
-    }
-}
-
+/// Decodes an AVD `redirectedServerCert` field into a DER-encoded X.509 certificate.
+///
+/// The outer Base64 payload encodes a UTF-16LE Base64 string whose decoded bytes follow the
+/// [MS-RDPBCGR] section 2.2.13.1.2.1 ("Target Certificate Container") layout.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
 #[doc(hidden)]
 pub fn decode_redirected_server_cert(outer_b64: &str) -> Option<Vec<u8>> {
+    const ELEMENT_HEADER_SIZE: usize = 4 /* Type */ + 4 /* Encoding */ + 4 /* Size */;
+
     let utf16_bytes = STANDARD.decode(outer_b64.trim()).ok()?;
     if !utf16_bytes.len().is_multiple_of(2) {
         return None;
@@ -1262,11 +1280,11 @@ pub fn decode_redirected_server_cert(outer_b64: &str) -> Option<Vec<u8>> {
     let inner_b64 = String::from_utf16(&code_units).ok()?;
     let container_bytes = STANDARD.decode(inner_b64.trim()).ok()?;
     let mut rest = container_bytes.as_slice();
-    while rest.len() >= 12 {
+    while ELEMENT_HEADER_SIZE <= rest.len() {
         let element_type = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         let encoding = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
         let element_size = usize::try_from(u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]])).ok()?;
-        rest = &rest[12..];
+        rest = &rest[ELEMENT_HEADER_SIZE..];
         if rest.len() < element_size {
             return None;
         }
@@ -1279,6 +1297,11 @@ pub fn decode_redirected_server_cert(outer_b64: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Decodes an AVD `redirectedAuthBlob` field into the redirection password cookie bytes.
+///
+/// See [MS-RDPBCGR] section 2.2.13.1.1 ("Server Redirection Packet (RDP_SERVER_REDIRECTION_PACKET)").
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
 #[doc(hidden)]
 pub fn decode_redirected_auth_blob(outer_b64: &str) -> Option<Vec<u8>> {
     let decoded = STANDARD.decode(outer_b64.trim()).ok()?;
@@ -1536,35 +1559,34 @@ fn normalize_oauth_authority_with_options(authority: &str, allow_loopback_http: 
     Ok(rewritten)
 }
 
-fn resource_default_scope(resource: &str) -> String {
+fn scope_with_suffix(resource: &str, suffix: &str) -> String {
     let trimmed = resource.trim().trim_end_matches('/');
     if trimmed.ends_with("/.default") || trimmed.ends_with("/user_impersonation") {
         trimmed.to_owned()
     } else {
-        format!("{trimmed}/.default")
+        format!("{trimmed}/{suffix}")
     }
+}
+
+fn resource_default_scope(resource: &str) -> String {
+    scope_with_suffix(resource, ".default")
 }
 
 fn host_impersonation_scope(resource_uri: &str) -> String {
-    let trimmed = resource_uri.trim().trim_end_matches('/');
-    if trimmed.ends_with("/user_impersonation") || trimmed.ends_with("/.default") {
-        trimmed.to_owned()
-    } else {
-        format!("{trimmed}/user_impersonation")
-    }
+    scope_with_suffix(resource_uri, "user_impersonation")
+}
+
+fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| STANDARD.decode(payload_b64))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn jwt_remaining_lifetime(token: &str) -> anyhow::Result<Option<Duration>> {
-    let Some(payload_b64) = token.split('.').nth(1) else {
-        return Ok(None);
-    };
-    let Ok(bytes) = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .or_else(|_| STANDARD.decode(payload_b64))
-    else {
-        return Ok(None);
-    };
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Some(json) = decode_jwt_payload(token) else {
         return Ok(None);
     };
     let Some(exp) = json.get("exp").and_then(serde_json::Value::as_u64) else {
@@ -1586,12 +1608,7 @@ fn extract_username_from_tokens(resp: &OAuthTokenResponse) -> Option<String> {
 }
 
 fn extract_username_from_jwt(jwt: &str) -> Option<String> {
-    let payload_b64 = jwt.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .or_else(|_| STANDARD.decode(payload_b64))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let json = decode_jwt_payload(jwt)?;
     for key in ["preferred_username", "upn", "unique_name", "email"] {
         if let Some(user) = json.get(key).and_then(serde_json::Value::as_str)
             && !user.is_empty()
@@ -1641,28 +1658,9 @@ struct PersistedTokenEntry {
 }
 
 fn default_token_cache_path() -> Option<PathBuf> {
-    if let Some(custom) = std::env::var_os("IRONRDP_AVD_TOKEN_CACHE") {
-        let path = PathBuf::from(custom);
-        return (!path.as_os_str().is_empty()).then_some(path);
-    }
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        Some(PathBuf::from(base).join("ironrdp").join("avd_tokens.json"))
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            return Some(PathBuf::from(xdg).join("ironrdp").join("avd_tokens.json"));
-        }
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("ironrdp")
-                .join("avd_tokens.json"),
-        )
-    }
+    let custom = std::env::var_os("IRONRDP_AVD_TOKEN_CACHE")?;
+    let path = PathBuf::from(custom);
+    (!path.as_os_str().is_empty()).then_some(path)
 }
 
 fn load_token_cache_file(path: &std::path::Path) -> HashMap<String, (Zeroizing<String>, String)> {

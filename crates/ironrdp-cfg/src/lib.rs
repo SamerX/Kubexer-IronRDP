@@ -15,7 +15,6 @@ const SECRET_KEYS: &[&str] = &[
     "ironrdp_rdcleanpathtoken",    // RDCleanPath authentication token
     "ironrdp_avd_gateway_token",   // AVD orchestration gateway bearer token
     "ironrdp_avd_sso_logon_token", // AVD orchestration SSO logon token
-    "ironrdp_entra_pop_token",     // Entra RDS AAD PoP access token
 ];
 
 /// Returns `true` when `key` names a property whose value is a secret (password or token).

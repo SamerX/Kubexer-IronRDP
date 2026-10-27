@@ -1494,19 +1494,7 @@ fn build_connect_request(args: ConnectArgs) -> anyhow::Result<Request> {
                 eprintln!("warning: skipped entry in {}: {error}", path.display());
             }
         }
-        if properties.username().is_none() {
-            let mut added_os = path.as_os_str().to_os_string();
-            added_os.push(".json");
-            let added_json = PathBuf::from(added_os);
-            if let Ok(json_text) =
-                std::fs::read_to_string(&added_json).or_else(|_| std::fs::read_to_string(path.with_extension("json")))
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text)
-                && let Some(user) = val.get("UserName").and_then(serde_json::Value::as_str)
-                && !user.is_empty()
-            {
-                properties.set_username(user.to_owned());
-            }
-        }
+        ironrdp_daemon::apply_rdp_launch_companion(path, &mut properties);
     }
 
     // `--prop` overrides win over the .rdp file but lose to the named flags below.

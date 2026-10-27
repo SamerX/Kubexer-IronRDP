@@ -1,24 +1,23 @@
-use std::sync::Arc;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ironrdp_cfg::PropertySetExt as _;
 use ironrdp_client::avd::{
-    AvdGatewayChallenge, AvdHostPopTokenRequest, AvdOAuthMode, AvdTokenProvider, ClaimsChallenge,
-    OAuthAvdTokenProvider, decode_redirected_auth_blob, decode_redirected_server_cert,
-    extract_ip_from_network_metadata, normalize_oauth_authority, parse_ice_servers_config,
+    AvdGatewayChallenge, AvdHostPopTokenRequest, AvdOAuthMode, ClaimsChallenge, OAuthAvdTokenProvider,
+    decode_redirected_auth_blob, decode_redirected_server_cert, extract_ip_from_network_metadata,
+    normalize_oauth_authority, parse_ice_servers_config,
 };
 use ironrdp_client::config::ConfigBuilder;
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_pdu::rdp::server_redirection::{ELEMENT_TYPE_CERTIFICATE, ENCODING_TYPE_ASN1_DER};
 use ironrdp_propertyset::PropertySet;
+use proptest::prelude::*;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 const DEFAULT_WVD_CLIENT_ID: &str = "a85cf173-4192-42f8-81fa-777a763e6e2c";
 
-// oracle: reference MSRDC AVD WWW-Authenticate Claims challenge format
+// oracle: spec RFC 7235 §4.1; mutant key-value parsing in ClaimsChallenge::parse
 #[test]
 fn parse_claims_challenge_header() {
     let header = "Claims:Authority=https://login.windows.net/4c5a5ec1-9ac5-4612-9b4c-6bed178bb65a;Client=a85cf173-4192-42f8-81fa-777a763e6e2c;Redirect=https://www.wvd.microsoft.com/webclient;Resource=https://www.wvd.microsoft.com;Site=501413";
@@ -35,7 +34,7 @@ fn parse_claims_challenge_header() {
     assert_eq!(challenge.site_id.as_deref(), Some("501413"));
 }
 
-// oracle: spec MS-RDPBCGR §2.2.13.1.2; property round-trip
+// oracle: spec MS-RDPBCGR §2.2.13.1.2.1; property round-trip
 #[test]
 fn decode_redirected_cert_and_auth_blob_roundtrip() {
     let cert_der = b"\x30\x82\x01\x0a\x02\x82\x01\x01\x00\xab\xcd\xef";
@@ -64,7 +63,16 @@ fn decode_redirected_cert_and_auth_blob_roundtrip() {
     assert_eq!(decode_redirected_auth_blob(&outer_cookie_b64).unwrap(), cookie);
 }
 
-// oracle: reference MSRDC AVD orchestration iceServersConfig and azureInstanceNetworkMetadata JSON
+// oracle: spec MS-RDPBCGR §2.2.13.1.1; mutant raw Base64 fallback in decode_redirected_auth_blob
+#[test]
+fn decode_redirected_auth_blob_raw_bytes_fallback() {
+    let raw_cookie = b"\xff\x00\xfe\x01\x80";
+    let outer_b64 = STANDARD.encode(raw_cookie);
+    assert_eq!(decode_redirected_auth_blob(&outer_b64).unwrap(), raw_cookie);
+    assert!(decode_redirected_auth_blob("").is_none());
+}
+
+// oracle: spec W3C WebRTC 1.0 §4.2.2; mutant camelCase iceServersConfig and publicIpAddress extraction
 #[test]
 fn parse_ice_servers_and_shortpath_network_metadata() {
     let ice_json = serde_json::json!({
@@ -89,39 +97,26 @@ fn parse_ice_servers_and_shortpath_network_metadata() {
     );
 }
 
-struct MockAvdTokenProvider;
-
-impl AvdTokenProvider for MockAvdTokenProvider {
-    fn acquire_gateway_token(&self, challenge: &AvdGatewayChallenge) -> anyhow::Result<(String, String)> {
-        assert_eq!(challenge.resource, "https://www.wvd.microsoft.com");
-        Ok(("mock-gw-token".to_owned(), "user1@downhillpro.xyz".to_owned()))
-    }
-
-    fn acquire_host_pop_token(&self, request: &AvdHostPopTokenRequest) -> anyhow::Result<String> {
-        assert!(request.resource_uri.starts_with("ms-device-service://"));
-        assert!(!request.req_cnf.is_empty());
-        Ok("mock-pop-token".to_owned())
-    }
-}
-
-// oracle: spec crates/ironrdp-client/README.md §IronRDP client
+// oracle: mutant string-encoded JSON, PascalCase keys, singular Url, and Password branches in parse_ice_servers_config and extract_ip_from_network_metadata
 #[test]
-fn custom_avd_token_provider_roundtrip() {
-    let provider: Arc<dyn AvdTokenProvider> = Arc::new(MockAvdTokenProvider);
-    let (gw_tok, user) = provider
-        .acquire_gateway_token(&AvdGatewayChallenge {
-            authority: "https://login.windows.net/common".to_owned(),
-            client_id: DEFAULT_WVD_CLIENT_ID.to_owned(),
-            resource: "https://www.wvd.microsoft.com".to_owned(),
-            site_id: Some("501413".to_owned()),
-            username_hint: None,
-        })
-        .unwrap();
-    assert_eq!(gw_tok, "mock-gw-token");
-    assert_eq!(user, "user1@downhillpro.xyz");
+fn parse_ice_servers_accepts_string_payload_and_pascal_case_fields() {
+    let serialized = serde_json::Value::String(
+        r#"{"IceServers":[{"Url":"turn:turn.example.com:3478","Username":"u1","Password":"p1"}]}"#.to_owned(),
+    );
+    let servers = parse_ice_servers_config(&serialized);
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].urls, vec!["turn:turn.example.com:3478".to_owned()]);
+    assert_eq!(servers[0].username.as_deref(), Some("u1"));
+    assert_eq!(servers[0].credential.as_deref(), Some("p1"));
+
+    let private_meta = serde_json::Value::String(r#"{"PrivateIpAddress":"10.20.30.40"}"#.to_owned());
+    assert_eq!(
+        extract_ip_from_network_metadata(&private_meta),
+        Some("10.20.30.40".parse().unwrap())
+    );
 }
 
-// oracle: spec RFC 6749 §6
+// oracle: spec RFC 6749 §3.1; mutant authority host allowlist and refresh-token cache key matching
 #[test]
 fn oauth_authority_allowlist_and_cross_authority_cache_lookup() {
     assert_eq!(
@@ -138,11 +133,23 @@ fn oauth_authority_allowlist_and_cross_authority_cache_lookup() {
         "rt-cross-tenant",
         "user1@downhillpro.xyz",
     );
+    assert!(
+        provider
+            .lookup_cached_refresh_token_for_test(
+                "https://login.microsoftonline.com/4c5a5ec1-9ac5-4612-9b4c-6bed178bb65a",
+                DEFAULT_WVD_CLIENT_ID,
+                Some("user1@downhillpro.xyz"),
+                false,
+            )
+            .is_none(),
+        "gateway lookup must not cross authorities without host-exchange opt-in"
+    );
     let (found_rt, found_user) = provider
         .lookup_cached_refresh_token_for_test(
             "https://login.microsoftonline.com/4c5a5ec1-9ac5-4612-9b4c-6bed178bb65a",
             DEFAULT_WVD_CLIENT_ID,
             Some("user1@downhillpro.xyz"),
+            true,
         )
         .unwrap();
     assert_eq!(found_rt, "rt-cross-tenant");
@@ -154,13 +161,14 @@ fn oauth_authority_allowlist_and_cross_authority_cache_lookup() {
                 "https://login.microsoftonline.com/common",
                 DEFAULT_WVD_CLIENT_ID,
                 Some("other@downhillpro.xyz"),
+                true,
             )
             .is_none(),
         "unmatched username hint must not return another account's refresh token"
     );
 }
 
-// oracle: spec crates/ironrdp-client/README.md §IronRDP client
+// oracle: spec MS-RDPBCGR §5.4.5.4; mutant AVD gateway credential-source exemption, secret-key redaction, and enablerdsaadauth transport guard in ConfigBuilder::build
 #[test]
 fn avd_gateway_config_accepts_logon_credentials_source_and_redacts_token_properties() {
     let mut ps = PropertySet::new();
@@ -201,7 +209,7 @@ fn avd_gateway_config_accepts_logon_credentials_source_and_redacts_token_propert
     );
 }
 
-// oracle: reference Windows App companion <rdp_file>.json UserName metadata
+// oracle: mutant companion <rdp_file>.json UserName lookup in ConfigBuilder::apply_rdp_launch_companion
 #[test]
 fn rdp_launch_companion_reads_added_json_extension() {
     let base = std::env::temp_dir().join(format!("ironrdp-companion-{}.rdp", Uuid::new_v4()));
@@ -217,7 +225,56 @@ fn rdp_launch_companion_reads_added_json_extension() {
     assert_eq!(ps.username(), Some("user1@downhillpro.xyz"));
 }
 
-// oracle: spec RFC 8628 §3.2; spec RFC 6749 §6
+// oracle: mutant replaced-extension <stem>.json fallback and existing-username precedence in ConfigBuilder::apply_rdp_launch_companion
+#[test]
+fn rdp_launch_companion_falls_back_to_replaced_extension_and_preserves_existing_username() {
+    let base = std::env::temp_dir().join(format!("ironrdp-companion-fallback-{}.rdp", Uuid::new_v4()));
+    let fallback_path = base.with_extension("json");
+    std::fs::write(&fallback_path, r#"{"UserName":"fallback@downhillpro.xyz"}"#).unwrap();
+
+    let mut ps = PropertySet::new();
+    ConfigBuilder::apply_rdp_launch_companion(&base, &mut ps);
+    assert_eq!(ps.username(), Some("fallback@downhillpro.xyz"));
+
+    let mut preset = PropertySet::new();
+    preset.set_username("explicit@downhillpro.xyz".to_owned());
+    ConfigBuilder::apply_rdp_launch_companion(&base, &mut preset);
+    let _ = std::fs::remove_file(&fallback_path);
+
+    assert_eq!(preset.username(), Some("explicit@downhillpro.xyz"));
+}
+
+// oracle: spec MS-RDPBCGR §2.2.13.1.2.1; spec RFC 7235 §4.1
+proptest! {
+    #[test]
+    fn avd_orchestration_parsers_never_panic_on_arbitrary_inputs(
+        raw_str in "\\PC*",
+        raw_bytes in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let _ = ClaimsChallenge::parse(&raw_str);
+        let _ = decode_redirected_server_cert(&raw_str);
+        let _ = decode_redirected_auth_blob(&raw_str);
+
+        let b64 = STANDARD.encode(&raw_bytes);
+        let _ = decode_redirected_server_cert(&b64);
+        let _ = decode_redirected_auth_blob(&b64);
+
+        let inner_b64 = STANDARD.encode(&raw_bytes);
+        let mut utf16_bytes = Vec::new();
+        for u in inner_b64.encode_utf16() {
+            utf16_bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let outer_b64 = STANDARD.encode(&utf16_bytes);
+        let _ = decode_redirected_server_cert(&outer_b64);
+        let _ = decode_redirected_auth_blob(&outer_b64);
+
+        let json_str = serde_json::Value::String(raw_str);
+        let _ = parse_ice_servers_config(&json_str);
+        let _ = extract_ip_from_network_metadata(&json_str);
+    }
+}
+
+// oracle: spec RFC 8628 §3.2; spec RFC 8628 §3.4; spec RFC 6749 §6
 #[tokio::test]
 async fn oauth_device_code_refresh_and_pop_exchange_roundtrip() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

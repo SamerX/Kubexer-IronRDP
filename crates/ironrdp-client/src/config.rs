@@ -2006,6 +2006,18 @@ impl ConfigBuilder {
         self
     }
 
+    fn is_avd_gateway(&self) -> bool {
+        #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+        {
+            matches!(self.transport, TransportKind::Gateway { .. })
+                && self.properties.get::<i64>("gatewaybrokeringtype") == Some(1)
+        }
+        #[cfg(not(all(feature = "gateway", feature = "entra-auth")))]
+        {
+            false
+        }
+    }
+
     /// List the required fields that still need a value before [`build`](Self::build) can succeed.
     ///
     /// Gateway credentials are only required when a gateway transport is selected.
@@ -2013,18 +2025,14 @@ impl ConfigBuilder {
     /// because [`build`](Self::build) resolves them from the RDP server account.
     pub fn missing(&self) -> Vec<MissingField> {
         let mut missing = Vec::new();
-        #[cfg(all(feature = "gateway", feature = "entra-auth"))]
-        let is_avd_gateway = matches!(self.transport, TransportKind::Gateway { .. })
-            && self.properties.get::<i64>("gatewaybrokeringtype") == Some(1);
-        #[cfg(all(feature = "gateway", not(feature = "entra-auth")))]
-        let is_avd_gateway = false;
-        #[cfg(all(not(feature = "gateway"), feature = "entra-auth"))]
-        let is_avd_gateway = false;
+        let is_avd_gateway = self.is_avd_gateway();
         #[cfg(feature = "entra-auth")]
         let uses_entra_auth = self.entra_auth.is_some()
             || (is_avd_gateway && self.properties.get::<bool>("enablerdsaadauth").unwrap_or(false));
         #[cfg(not(feature = "entra-auth"))]
         let uses_entra_auth = false;
+        #[cfg(not(feature = "gateway"))]
+        let _ = is_avd_gateway;
         #[cfg(all(windows, feature = "vmconnect"))]
         let uses_current_vmconnect_credentials = self.vm_id.is_some() && self.vmconnect_current_user;
         #[cfg(not(all(windows, feature = "vmconnect")))]
@@ -2127,11 +2135,7 @@ impl ConfigBuilder {
             );
         }
 
-        #[cfg(all(feature = "gateway", feature = "entra-auth"))]
-        let is_avd_gateway = matches!(self.transport, TransportKind::Gateway { .. })
-            && self.properties.get::<i64>("gatewaybrokeringtype") == Some(1);
-        #[cfg(not(all(feature = "gateway", feature = "entra-auth")))]
-        let is_avd_gateway = false;
+        let is_avd_gateway = self.is_avd_gateway();
         if self.properties.get::<i64>("gatewaybrokeringtype") == Some(1) && !is_avd_gateway {
             anyhow::bail!(
                 "AVD gateway orchestration (gatewaybrokeringtype:i:1) requires the HTTP/WebSocket gateway transport and the entra-auth feature"
