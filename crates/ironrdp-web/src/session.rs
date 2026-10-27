@@ -23,6 +23,7 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -44,7 +45,8 @@ use crate::canvas::{Canvas, RenderTarget};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
-use crate::image::extract_partial_image;
+use crate::frame::FrameScheduler;
+use crate::image::{extract_partial_image, extract_smallest_rectangle};
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
@@ -799,6 +801,12 @@ impl iron_remote_desktop::Session for Session {
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
 
+        // An OffscreenCanvas paints once per animation frame; a <canvas> element paints every update.
+        let (mut frame_scheduler, mut frame_ticks) = match self.render_target {
+            RenderTarget::Offscreen(_) => FrameScheduler::new().unzip(),
+            RenderTarget::Html(_) => (None, None),
+        };
+
         // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
         let activation_factory = connection_result.activation_factory;
 
@@ -824,6 +832,13 @@ impl iron_remote_desktop::Session for Session {
                     trace!(?action, frame_length = payload.len(), "Frame received");
 
                     active_stage.process(&mut image, action, &payload, framed.last_read_at())?
+                }
+                _ = next_frame_tick(&mut frame_ticks).fuse() => {
+                    if let Some(scheduler) = frame_scheduler.as_mut() {
+                        paint_regions(&gui, &image, scheduler.on_frame(), &mut draw_buffer)?;
+                    }
+
+                    Vec::new()
                 }
                 input_events = input_events.next() => {
                     let event = input_events.context("read next input events")?;
@@ -1034,10 +1049,14 @@ impl iron_remote_desktop::Session for Session {
                             .context("Send frame to writer task")?;
                     }
                     ActiveStageOutput::GraphicsUpdate(region) => {
-                        let region = extract_partial_image(&image, region, &mut draw_buffer);
-                        gui.draw(draw_buffer.filled_mut(), region)
-                            .context("draw updated region")?;
-                        draw_buffer.clear();
+                        if let Some(scheduler) = frame_scheduler.as_mut() {
+                            scheduler.add(region);
+                        } else {
+                            let region = extract_partial_image(&image, region, &mut draw_buffer);
+                            gui.draw(draw_buffer.filled_mut(), region)
+                                .context("draw updated region")?;
+                            draw_buffer.clear();
+                        }
                     }
                     ActiveStageOutput::PointerDefault => {
                         self.set_cursor_style(CursorStyle::Default)?;
@@ -1153,6 +1172,12 @@ impl iron_remote_desktop::Session for Session {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
 
+                        // Paint what is still pending from the current framebuffer before the resize clears the
+                        // canvas and the reactivation replaces the framebuffer.
+                        if let Some(scheduler) = frame_scheduler.as_mut() {
+                            paint_regions(&gui, &image, scheduler.take_pending(), &mut draw_buffer)?;
+                        }
+
                         // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
                         // with the previous dimensions arriving between the resize request and this message.
                         if let Some((width, height)) = requested_resize {
@@ -1236,6 +1261,14 @@ impl iron_remote_desktop::Session for Session {
                 }
             }
         };
+
+        // Leave the last frame on screen, as an immediate paint would have. Dropping the scheduler
+        // cancels its pending animation frame.
+        if let Some(mut scheduler) = frame_scheduler.take()
+            && let Err(error) = paint_regions(&gui, &image, scheduler.take_pending(), &mut draw_buffer)
+        {
+            warn!(%error, "Failed to paint the final frame");
+        }
 
         info!(%disconnect_reason, "RDP session terminated");
 
@@ -1399,6 +1432,35 @@ impl iron_remote_desktop::Session for Session {
                 .with_kind(IronErrorKind::General),
         )
     }
+}
+
+/// Resolves on the next animation frame tick, or never when frames aren't batched.
+async fn next_frame_tick(ticks: &mut Option<mpsc::UnboundedReceiver<()>>) {
+    if let Some(ticks) = ticks
+        && ticks.next().await.is_some()
+    {
+        return;
+    }
+
+    core::future::pending::<()>().await;
+}
+
+/// Paints the batched dirty `regions` from the current framebuffer, one `ImageData` per region.
+/// Regions are extracted exactly (never widened to whole rows): merged regions are often wide.
+fn paint_regions(
+    gui: &Canvas,
+    image: &DecodedImage,
+    regions: Vec<InclusiveRectangle>,
+    draw_buffer: &mut WriteBuf,
+) -> anyhow::Result<()> {
+    for region in regions {
+        let region = extract_smallest_rectangle(image, region, draw_buffer);
+        gui.draw(draw_buffer.filled_mut(), region)
+            .context("draw updated region")?;
+        draw_buffer.clear();
+    }
+
+    Ok(())
 }
 
 fn into_object(val: JsValue) -> Result<js_sys::Object, IronError> {

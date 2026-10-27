@@ -19,8 +19,9 @@ pub(crate) fn extract_partial_image(
     }
 }
 
+/// Copies exactly the dirty `region` into `buffer`, one row at a time (never widened).
 // Faster for low-height and smaller images
-fn extract_smallest_rectangle(
+pub(crate) fn extract_smallest_rectangle(
     image: &DecodedImage,
     region: InclusiveRectangle,
     buffer: &mut WriteBuf,
