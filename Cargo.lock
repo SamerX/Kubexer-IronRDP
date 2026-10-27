@@ -5086,9 +5086,9 @@ dependencies = [
 
 [[package]]
 name = "picky-krb"
-version = "0.12.4"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d188f3192356068dbdba54bddbca6fd0f7a09565d3861eeb8efe1ab77ae8e97"
+checksum = "4a272e7c4191fbb5ea7e0b34f47208804d47a6f748344351ba9229b0e5a604ed"
 dependencies = [
  "aes 0.9.3",
  "block-padding",
@@ -6504,8 +6504,7 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 [[package]]
 name = "sspi"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "256b74a75c961d4eb11e0e302a4451cdc51d713d5f26b2ede8156ba61cca5d7e"
+source = "git+https://github.com/Devolutions/sspi-rs?rev=08d862279488dcdd0030050d7047bef85686a57a#08d862279488dcdd0030050d7047bef85686a57a"
 dependencies = [
  "async-dnssd",
  "async-recursion",
@@ -6699,7 +6698,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -8077,8 +8076,7 @@ dependencies = [
 [[package]]
 name = "winscard"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "060a9e7ea89246300455586df88643c1083df8d1c770246207bcf6c419c665f2"
+source = "git+https://github.com/Devolutions/sspi-rs?rev=08d862279488dcdd0030050d7047bef85686a57a#08d862279488dcdd0030050d7047bef85686a57a"
 dependencies = [
  "bitflags 2.13.2",
  "crypto-bigint",

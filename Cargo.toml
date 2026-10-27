@@ -206,3 +206,9 @@ opt-level = 3
 
 [profile.test.package.rand_chacha]
 opt-level = 3
+
+# Kubexer: sspi with the Kerberos mechListMIC fix (Devolutions/sspi-rs#748, fixed by #772).
+# sspi 0.23.0 rejects the Windows acceptor's mechListMIC, which is signed with sequence number 0.
+# Drop this once an sspi release newer than 0.23.0 is on crates.io.
+[patch.crates-io]
+sspi = { git = "https://github.com/Devolutions/sspi-rs", rev = "08d862279488dcdd0030050d7047bef85686a57a" }
