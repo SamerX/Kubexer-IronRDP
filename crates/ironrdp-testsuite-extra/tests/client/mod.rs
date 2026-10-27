@@ -1,3 +1,4 @@
+mod avd;
 mod config;
 mod egfx_cache;
 mod entra;
