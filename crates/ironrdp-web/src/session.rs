@@ -101,6 +101,8 @@ struct SessionBuilderInner {
     enable_standard_rdp_security: bool,
     enable_server_pointer: bool,
     legacy_graphics: bool,
+    performance_flags: Option<PerformanceFlags>,
+    color_depth: Option<u32>,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -147,6 +149,8 @@ impl Default for SessionBuilderInner {
             enable_standard_rdp_security: false,
             enable_server_pointer: true,
             legacy_graphics: false,
+            performance_flags: None,
+            color_depth: None,
             outbound_message_size_limit: None,
         }
     }
@@ -298,6 +302,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |performance_flags: f64| { self.0.borrow_mut().performance_flags = parse_performance_flags(performance_flags) };
+            |color_depth: f64| { self.0.borrow_mut().color_depth = parse_color_depth(color_depth) };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -479,6 +485,18 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let enable_server_pointer = self.0.borrow().enable_server_pointer;
         config.enable_server_pointer = enable_server_pointer;
+
+        if let Some(performance_flags) = self.0.borrow().performance_flags {
+            config.performance_flags = performance_flags;
+        }
+
+        // Legacy graphics mode always uses 32-bpp lossless bitmaps.
+        if let Some(color_depth) = self.0.borrow().color_depth
+            && !legacy_graphics
+            && let Some(bitmap) = config.bitmap.as_mut()
+        {
+            bitmap.color_depth = color_depth;
+        }
 
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 
@@ -2009,6 +2027,51 @@ where
     }
 }
 
+/// Converts a JS number to `u32`, rejecting non-integral and out-of-range values.
+fn f64_to_u32_exact(value: f64) -> Option<u32> {
+    if value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value) {
+        #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Some(value as u32)
+    } else {
+        None
+    }
+}
+
+/// Parses the raw `TS_EXTENDED_INFO_PACKET.performanceFlags` bitmask; unknown bits are dropped.
+///
+/// Returns `None` (keep the default flags) for values that are not a valid `u32`.
+fn parse_performance_flags(value: f64) -> Option<PerformanceFlags> {
+    let Some(bits) = f64_to_u32_exact(value) else {
+        warn!(value, "Invalid performance flags; using the default flags");
+        return None;
+    };
+
+    let flags = PerformanceFlags::from_bits_truncate(bits);
+    let unknown = bits & !flags.bits();
+
+    if unknown != 0 {
+        warn!(
+            unknown = format_args!("{unknown:#x}"),
+            "Unknown performance flags dropped"
+        );
+    }
+
+    Some(flags)
+}
+
+/// Parses the requested bitmap color depth; only 16, 24 and 32 bpp are accepted.
+///
+/// Returns `None` (keep the default color depth) for any other value.
+fn parse_color_depth(value: f64) -> Option<u32> {
+    match f64_to_u32_exact(value) {
+        Some(color_depth @ (16 | 24 | 32)) => Some(color_depth),
+        _ => {
+            warn!(value, "Unsupported color depth; using the default color depth");
+            None
+        }
+    }
+}
+
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn f64_to_u16_saturating_cast(value: f64) -> u16 {
     value as u16
@@ -2615,6 +2678,47 @@ mod tests {
                 assert_eq!(flags.bits(), 0x1);
             }
             _ => panic!("Expected correct flags conversion"),
+        }
+    }
+
+    #[test]
+    fn performance_flags_parsing() {
+        assert_eq!(parse_performance_flags(0.0), Some(PerformanceFlags::empty()));
+        assert_eq!(
+            parse_performance_flags(f64::from(PerformanceFlags::default().bits())),
+            Some(PerformanceFlags::default())
+        );
+        assert_eq!(
+            parse_performance_flags(f64::from(0x0000_0181u32)),
+            Some(
+                PerformanceFlags::DISABLE_WALLPAPER
+                    | PerformanceFlags::ENABLE_FONT_SMOOTHING
+                    | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION
+            )
+        );
+        // Unknown bits are dropped, known bits are kept.
+        assert_eq!(
+            parse_performance_flags(f64::from(0x0001_0001u32)),
+            Some(PerformanceFlags::DISABLE_WALLPAPER)
+        );
+        assert_eq!(
+            parse_performance_flags(f64::from(u32::MAX)),
+            Some(PerformanceFlags::all())
+        );
+
+        for invalid in [-1.0, 1.5, f64::from(u32::MAX) + 1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(parse_performance_flags(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn color_depth_parsing() {
+        assert_eq!(parse_color_depth(16.0), Some(16));
+        assert_eq!(parse_color_depth(24.0), Some(24));
+        assert_eq!(parse_color_depth(32.0), Some(32));
+
+        for invalid in [0.0, 8.0, 15.0, 24.5, 64.0, -16.0, f64::NAN] {
+            assert_eq!(parse_color_depth(invalid), None, "{invalid}");
         }
     }
 }

@@ -76,6 +76,26 @@ export function legacyGraphics(enable: boolean): Extension {
     return new Extension('legacy_graphics', enable);
 }
 
+/**
+ * Set the performance flags sent to the server (see `PerformanceFlag`).
+ *
+ * Defaults to `DEFAULT_PERFORMANCE_FLAGS`. Unknown bits are dropped.
+ */
+export function performanceFlags(flags: number): Extension {
+    return new Extension('performance_flags', flags);
+}
+
+/**
+ * Set the bitmap color depth in bits per pixel: 16 (default), 24 or 32.
+ *
+ * Ignored when `legacyGraphics(true)` is set, which always uses 32 bpp.
+ */
+export function colorDepth(bpp: number): Extension {
+    return new Extension('color_depth', bpp);
+}
+
+export { PerformanceFlag, DEFAULT_PERFORMANCE_FLAGS } from './PerformanceFlag';
+
 // --- RDCleanPath ---
 
 export { RDCleanPathErrorCode } from './RDCleanPathErrorCode';
