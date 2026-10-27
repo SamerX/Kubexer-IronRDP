@@ -9,31 +9,82 @@ use ironrdp::pdu::geometry::Rectangle as _;
 use wasm_bindgen::{Clamped, JsCast as _};
 #[cfg(target_arch = "wasm32")]
 use web_sys::ImageData;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, OffscreenCanvas, OffscreenCanvasRenderingContext2d};
+
+/// What the session renders into: a main-thread `<canvas>` element, or an `OffscreenCanvas`
+/// (typically transferred into a Web Worker with `canvas.transferControlToOffscreen()`).
+#[derive(Clone)]
+pub(crate) enum RenderTarget {
+    Html(HtmlCanvasElement),
+    Offscreen(OffscreenCanvas),
+}
+
+/// A render target paired with its matching 2D context.
+enum Surface {
+    Html {
+        canvas: HtmlCanvasElement,
+        ctx: CanvasRenderingContext2d,
+    },
+    Offscreen {
+        canvas: OffscreenCanvas,
+        ctx: OffscreenCanvasRenderingContext2d,
+    },
+}
 
 /// Web render surface: blits each dirty region to the canvas with `put_image_data`.
 pub(crate) struct Canvas {
-    canvas: HtmlCanvasElement,
-    ctx: CanvasRenderingContext2d,
+    surface: Surface,
 }
 
 impl Canvas {
-    pub(crate) fn new(render_canvas: HtmlCanvasElement, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<Self> {
-        render_canvas.set_width(width.get());
-        render_canvas.set_height(height.get());
-        let ctx = context_2d(&render_canvas)?;
+    pub(crate) fn new(target: RenderTarget, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<Self> {
+        let surface = match target {
+            RenderTarget::Html(render_canvas) => {
+                render_canvas.set_width(width.get());
+                render_canvas.set_height(height.get());
+                let ctx = context_2d(&render_canvas)?;
 
-        Ok(Self {
-            canvas: render_canvas,
-            ctx,
-        })
+                Surface::Html {
+                    canvas: render_canvas,
+                    ctx,
+                }
+            }
+            RenderTarget::Offscreen(render_canvas) => {
+                render_canvas.set_width(width.get());
+                render_canvas.set_height(height.get());
+                let ctx = offscreen_context_2d(&render_canvas)?;
+
+                Surface::Offscreen {
+                    canvas: render_canvas,
+                    ctx,
+                }
+            }
+        };
+
+        Ok(Self { surface })
+    }
+
+    /// Current backing-store size in pixels.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match &self.surface {
+            Surface::Html { canvas, .. } => (canvas.width(), canvas.height()),
+            Surface::Offscreen { canvas, .. } => (canvas.width(), canvas.height()),
+        }
     }
 
     /// Resizes the backing store. Note: this also clears the canvas and resets 2D context state;
     /// the cached `ctx` stays valid.
     pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {
-        self.canvas.set_width(width.get());
-        self.canvas.set_height(height.get());
+        match &self.surface {
+            Surface::Html { canvas, .. } => {
+                canvas.set_width(width.get());
+                canvas.set_height(height.get());
+            }
+            Surface::Offscreen { canvas, .. } => {
+                canvas.set_width(width.get());
+                canvas.set_height(height.get());
+            }
+        }
     }
 
     /// Blits a dirty region with `put_image_data`. Forces alpha opaque first: the framebuffer isn't
@@ -51,13 +102,16 @@ impl Canvas {
                 u32::from(region.height()),
             )
             .map_err(|err| anyhow!("ImageData::new failed: {err:?}"))?;
-            self.ctx
-                .put_image_data(&image, f64::from(region.left), f64::from(region.top))
-                .map_err(|err| anyhow!("put_image_data failed: {err:?}"))
+            let (left, top) = (f64::from(region.left), f64::from(region.top));
+            match &self.surface {
+                Surface::Html { ctx, .. } => ctx.put_image_data(&image, left, top),
+                Surface::Offscreen { ctx, .. } => ctx.put_image_data(&image, left, top),
+            }
+            .map_err(|err| anyhow!("put_image_data failed: {err:?}"))
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (&self.ctx, buffer, region);
+            let _ = (&self.surface, buffer, region);
             unimplemented!("web canvas is only available on wasm32")
         }
     }
@@ -73,6 +127,27 @@ fn context_2d(canvas: &HtmlCanvasElement) -> anyhow::Result<CanvasRenderingConte
             .ok_or_else(|| anyhow!("canvas has no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()
             .map_err(|_| anyhow!("2d context is not a CanvasRenderingContext2d"))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = canvas;
+        unimplemented!("web canvas is only available on wasm32")
+    }
+}
+
+/// Acquires the offscreen canvas 2D context (wasm only; panics on other targets).
+///
+/// An `OffscreenCanvas` hands out an `OffscreenCanvasRenderingContext2D`, a distinct interface from
+/// `CanvasRenderingContext2D`, and the only 2D context type that exists in a Web Worker.
+fn offscreen_context_2d(canvas: &OffscreenCanvas) -> anyhow::Result<OffscreenCanvasRenderingContext2d> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        canvas
+            .get_context("2d")
+            .map_err(|err| anyhow!("get_context(\"2d\") failed: {err:?}"))?
+            .ok_or_else(|| anyhow!("offscreen canvas has no 2d context"))?
+            .dyn_into::<OffscreenCanvasRenderingContext2d>()
+            .map_err(|_| anyhow!("2d context is not an OffscreenCanvasRenderingContext2D"))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

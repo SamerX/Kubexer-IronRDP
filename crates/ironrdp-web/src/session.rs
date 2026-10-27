@@ -38,9 +38,9 @@ use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlCanvasElement;
+use web_sys::{HtmlCanvasElement, OffscreenCanvas};
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, RenderTarget};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
@@ -75,11 +75,12 @@ struct SessionBuilderInner {
     client_name: String,
     desktop_size: DesktopSize,
 
-    render_canvas: Option<HtmlCanvasElement>,
+    render_target: Option<RenderTarget>,
     set_cursor_style_callback: Option<js_sys::Function>,
     set_cursor_style_callback_context: Option<JsValue>,
     remote_clipboard_changed_callback: Option<js_sys::Function>,
     force_clipboard_update_callback: Option<js_sys::Function>,
+    surface_resized_callback: Option<js_sys::Function>,
     // File transfer callbacks
     files_available_callback: Option<js_sys::Function>,
     file_contents_request_callback: Option<js_sys::Function>,
@@ -125,11 +126,12 @@ impl Default for SessionBuilderInner {
                 height: DEFAULT_HEIGHT,
             },
 
-            render_canvas: None,
+            render_target: None,
             set_cursor_style_callback: None,
             set_cursor_style_callback_context: None,
             remote_clipboard_changed_callback: None,
             force_clipboard_update_callback: None,
+            surface_resized_callback: None,
             files_available_callback: None,
             file_contents_request_callback: None,
             file_contents_response_callback: None,
@@ -238,9 +240,18 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         self.clone()
     }
 
-    /// Optional
+    /// Required, unless `render_offscreen_canvas` is used instead. Replaces any previously set render target.
     fn render_canvas(&self, canvas: HtmlCanvasElement) -> Self {
-        self.0.borrow_mut().render_canvas = Some(canvas);
+        self.0.borrow_mut().render_target = Some(RenderTarget::Html(canvas));
+        self.clone()
+    }
+
+    /// Required, unless `render_canvas` is used instead. Replaces any previously set render target.
+    ///
+    /// Renders into an `OffscreenCanvas`, e.g. one transferred into a Web Worker with
+    /// `canvas.transferControlToOffscreen()`.
+    fn render_offscreen_canvas(&self, canvas: OffscreenCanvas) -> Self {
+        self.0.borrow_mut().render_target = Some(RenderTarget::Offscreen(canvas));
         self.clone()
     }
 
@@ -337,6 +348,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |format_list_response_callback: JsValue| {
                 self.0.borrow_mut().format_list_response_callback = format_list_response_callback.dyn_into::<js_sys::Function>().ok();
             };
+            |surface_resized_callback: JsValue| {
+                self.0.borrow_mut().surface_resized_callback = surface_resized_callback.dyn_into::<js_sys::Function>().ok();
+            };
             |print_job_stream_callbacks: JsValue| {
                 let mut inner = self.0.borrow_mut();
                 match parse_print_job_stream_callbacks(print_job_stream_callbacks) {
@@ -393,11 +407,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             kdc_proxy_url,
             client_name,
             desktop_size,
-            render_canvas,
+            render_target,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
             remote_clipboard_changed_callback,
             force_clipboard_update_callback,
+            surface_resized_callback,
             files_available_callback,
             file_contents_request_callback,
             file_contents_response_callback,
@@ -431,7 +446,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             client_name = inner.client_name.clone();
             desktop_size = inner.desktop_size;
 
-            render_canvas = inner.render_canvas.clone().context("render_canvas missing")?;
+            render_target = inner.render_target.clone().context("render_canvas missing")?;
 
             set_cursor_style_callback = inner
                 .set_cursor_style_callback
@@ -443,6 +458,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 .context("set_cursor_style_callback_context missing")?;
             remote_clipboard_changed_callback = inner.remote_clipboard_changed_callback.clone();
             force_clipboard_update_callback = inner.force_clipboard_update_callback.clone();
+            surface_resized_callback = inner.surface_resized_callback.clone();
             files_available_callback = inner.files_available_callback.clone();
             file_contents_request_callback = inner.file_contents_request_callback.clone();
             file_contents_response_callback = inner.file_contents_response_callback.clone();
@@ -608,9 +624,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             writer_tx,
             input_events_tx,
 
-            render_canvas,
+            render_target,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
+            surface_resized_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -656,9 +673,10 @@ pub(crate) struct Session {
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 
-    render_canvas: HtmlCanvasElement,
+    render_target: RenderTarget,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
+    surface_resized_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -706,6 +724,23 @@ impl Session {
 
         Ok(())
     }
+
+    /// Reports the render surface's backing-store size to the `surface_resized_callback` extension,
+    /// if one was registered. With an `OffscreenCanvas` the page can no longer read the size itself.
+    fn notify_surface_resized(&self, gui: &Canvas) {
+        let Some(callback) = &self.surface_resized_callback else {
+            return;
+        };
+
+        let (width, height) = gui.size();
+        if let Err(error) = callback.call2(
+            &JsValue::NULL,
+            &JsValue::from_f64(f64::from(width)),
+            &JsValue::from_f64(f64::from(height)),
+        ) {
+            warn!(?error, "surface_resized_callback failed");
+        }
+    }
 }
 
 impl iron_remote_desktop::Session for Session {
@@ -746,7 +781,8 @@ impl iron_remote_desktop::Session for Session {
             NonZeroU32::new(u32::from(connection_result.desktop_size.height)).context("desktop height is zero")?;
 
         let mut gui =
-            Canvas::new(self.render_canvas.clone(), desktop_width, desktop_height).context("canvas initialization")?;
+            Canvas::new(self.render_target.clone(), desktop_width, desktop_height).context("canvas initialization")?;
+        self.notify_surface_resized(&gui);
 
         debug!("Canvas initialized");
 
@@ -1121,6 +1157,7 @@ impl iron_remote_desktop::Session for Session {
                         // with the previous dimensions arriving between the resize request and this message.
                         if let Some((width, height)) = requested_resize {
                             gui.resize(width, height);
+                            self.notify_surface_resized(&gui);
                             requested_resize = None;
                         }
 
@@ -1689,7 +1726,12 @@ fn printer_driver_name_for_macos_major_version(macos_major_version: Option<u32>)
 
 #[cfg(target_arch = "wasm32")]
 fn browser_macos_major_version() -> Option<u32> {
-    let user_agent = web_sys::window()?.navigator().user_agent().ok()?;
+    // `navigator.userAgent` read off the global scope: a `Navigator` in a Window, a
+    // `WorkerNavigator` in a Web Worker.
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("navigator")).ok()?;
+    let user_agent = js_sys::Reflect::get(&navigator, &JsValue::from_str("userAgent"))
+        .ok()?
+        .as_string()?;
     macos_major_version_from_user_agent(&user_agent)
 }
 

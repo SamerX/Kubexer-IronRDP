@@ -94,6 +94,17 @@ export function colorDepth(bpp: number): Extension {
     return new Extension('color_depth', bpp);
 }
 
+/**
+ * Called with the render surface's backing-store size, in pixels, once the canvas is set up and
+ * after every resize.
+ *
+ * Useful with `renderOffscreenCanvas`: after `transferControlToOffscreen()` the page can no longer
+ * read `canvas.width` / `canvas.height`.
+ */
+export function surfaceResizedCallback(cb: (width: number, height: number) => void): Extension {
+    return new Extension('surface_resized_callback', cb as unknown);
+}
+
 export { PerformanceFlag, DEFAULT_PERFORMANCE_FLAGS } from './PerformanceFlag';
 
 // --- RDCleanPath ---

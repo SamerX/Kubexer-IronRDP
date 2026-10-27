@@ -56,9 +56,9 @@ web-sys = { version = "0.3", features = [
     "CanvasRenderingContext2d",
     "HtmlCanvasElement",
     "ImageData",
-    "Navigator",
+    "OffscreenCanvas",
+    "OffscreenCanvasRenderingContext2d",
     "Performance",
-    "Window",
 ] }
 js-sys = "0.3"
 gloo-net = { version = "0.7", default-features = false, features = ["websocket", "http", "io-util"] }

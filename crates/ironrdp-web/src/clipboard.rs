@@ -996,10 +996,12 @@ impl CliprdrBackend for WasmClipboardBackend {
         // Prefer Performance.now() for a monotonic clock that won't jump
         // backwards on NTP adjustments. Fall back to Date.now() if the
         // Performance API is unavailable (e.g. in non-browser WASM runtimes).
+        // Read off the global scope so this works in a Window and in a Web Worker alike.
         #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::as_conversions)]
         {
-            web_sys::window()
-                .and_then(|w| w.performance())
+            js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
+                .ok()
+                .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
                 .map_or_else(|| js_sys::Date::now() as u64, |p| p.now() as u64)
         }
     }
