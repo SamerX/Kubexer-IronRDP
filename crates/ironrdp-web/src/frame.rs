@@ -15,7 +15,8 @@ use wasm_bindgen::closure::Closure;
 
 /// Above this many disjoint rectangles the pending set collapses into its bounding rectangle,
 /// which keeps both memory and the per-flush call count bounded (e.g. while a hidden page
-/// throttles animation frames).
+/// throttles animation frames). Painting the bounding rectangle allocates nothing: it is copied
+/// into the canvas's persistent backbuffer like any other dirty rectangle.
 const MAX_PENDING_RECTS: usize = 256;
 
 fn area(rect: &InclusiveRectangle) -> u64 {
@@ -32,12 +33,9 @@ fn should_merge(a: &InclusiveRectangle, b: &InclusiveRectangle) -> bool {
     area(&a.union(b)) <= covered
 }
 
-/// The bounding rectangle replaces the whole set when it paints at most `3/2` of the set's area.
-fn bounds_worth_it(bounds_area: u64, summed_area: u64) -> bool {
-    bounds_area.saturating_mul(2) <= summed_area.saturating_mul(3)
-}
-
 /// Dirty rectangles accumulated since the last paint.
+///
+/// At most `MAX_PENDING_RECTS + 1` rectangles are held, and the storage is reused across frames.
 #[derive(Debug, Default)]
 pub(crate) struct DirtyRegions {
     rects: Vec<InclusiveRectangle>,
@@ -59,22 +57,13 @@ impl DirtyRegions {
         }
     }
 
-    /// Takes the rectangles to paint: a single bounding rectangle when it is cheap enough
-    /// compared to painting the rectangles one by one.
-    pub(crate) fn take(&mut self) -> Vec<InclusiveRectangle> {
-        if self.rects.len() > 1 {
-            let bounds = InclusiveRectangle::union_all(&self.rects);
-            let summed = self.rects.iter().map(area).fold(0u64, u64::saturating_add);
-
-            if bounds_worth_it(area(&bounds), summed) {
-                self.rects.clear();
-                return vec![bounds];
-            }
-        }
-
-        core::mem::take(&mut self.rects)
+    /// The rectangles to paint. They are painted as they are: a bounding rectangle would paint
+    /// pixels that did not change.
+    pub(crate) fn as_slice(&self) -> &[InclusiveRectangle] {
+        &self.rects
     }
 
+    /// Forgets the pending rectangles, keeping the storage for the next frame.
     pub(crate) fn clear(&mut self) {
         self.rects.clear();
     }
@@ -152,16 +141,17 @@ impl FrameScheduler {
         }
     }
 
-    /// Called when the animation frame fired: returns the rectangles to paint now.
-    pub(crate) fn on_frame(&mut self) -> Vec<InclusiveRectangle> {
+    /// Called when the animation frame fired: returns the rectangles to paint now (clear them
+    /// once painted).
+    pub(crate) fn on_frame(&mut self) -> &mut DirtyRegions {
         self.scheduled = None;
-        self.dirty.take()
+        &mut self.dirty
     }
 
-    /// Takes the pending rectangles for an out-of-band paint (e.g. before a resize). The animation
-    /// frame stays requested and finds nothing left to paint.
-    pub(crate) fn take_pending(&mut self) -> Vec<InclusiveRectangle> {
-        self.dirty.take()
+    /// The pending rectangles, for an out-of-band paint (e.g. before a resize). The animation
+    /// frame stays requested and finds nothing left to paint once they are cleared.
+    pub(crate) fn pending(&mut self) -> &mut DirtyRegions {
+        &mut self.dirty
     }
 
     fn request_frame(&self) -> Option<JsValue> {
@@ -200,14 +190,20 @@ mod tests {
         }
     }
 
+    fn take(dirty: &mut DirtyRegions) -> Vec<InclusiveRectangle> {
+        let rects = dirty.as_slice().to_vec();
+        dirty.clear();
+        rects
+    }
+
     #[test]
     fn repeated_region_is_kept_once() {
         let mut dirty = DirtyRegions::default();
         for _ in 0..10 {
             dirty.add(rect(100, 100, 739, 459));
         }
-        assert_eq!(dirty.take(), vec![rect(100, 100, 739, 459)]);
-        assert!(dirty.take().is_empty());
+        assert_eq!(take(&mut dirty), vec![rect(100, 100, 739, 459)]);
+        assert!(take(&mut dirty).is_empty());
     }
 
     #[test]
@@ -215,7 +211,7 @@ mod tests {
         let mut dirty = DirtyRegions::default();
         dirty.add(rect(0, 0, 99, 99));
         dirty.add(rect(10, 10, 19, 19));
-        assert_eq!(dirty.take(), vec![rect(0, 0, 99, 99)]);
+        assert_eq!(take(&mut dirty), vec![rect(0, 0, 99, 99)]);
     }
 
     #[test]
@@ -224,7 +220,7 @@ mod tests {
         dirty.add(rect(0, 0, 63, 63));
         dirty.add(rect(64, 0, 127, 63));
         dirty.add(rect(0, 64, 127, 127));
-        assert_eq!(dirty.take(), vec![rect(0, 0, 127, 127)]);
+        assert_eq!(take(&mut dirty), vec![rect(0, 0, 127, 127)]);
     }
 
     #[test]
@@ -232,7 +228,7 @@ mod tests {
         let mut dirty = DirtyRegions::default();
         dirty.add(rect(0, 0, 63, 63));
         dirty.add(rect(1000, 1000, 1063, 1063));
-        let mut taken = dirty.take();
+        let mut taken = take(&mut dirty);
         taken.sort_by_key(|r| r.left);
         assert_eq!(taken, vec![rect(0, 0, 63, 63), rect(1000, 1000, 1063, 1063)]);
     }
@@ -242,9 +238,8 @@ mod tests {
         let mut dirty = DirtyRegions::default();
         dirty.add(rect(0, 0, 999, 999));
         dirty.add(rect(1100, 0, 1163, 63));
-        assert_eq!(dirty.rects.len(), 2);
-        // Painting the bounding rectangle is still cheap enough: one paint at flush time.
-        assert_eq!(dirty.take(), vec![rect(0, 0, 1163, 999)]);
+        // Nor at paint time: the bounding rectangle would repaint unchanged pixels.
+        assert_eq!(take(&mut dirty), vec![rect(0, 0, 999, 999), rect(1100, 0, 1163, 63)]);
     }
 
     #[test]
@@ -252,8 +247,27 @@ mod tests {
         let mut dirty = DirtyRegions::default();
         dirty.add(rect(0, 0, 63, 63));
         dirty.add(rect(64, 64, 127, 127));
-        // Their bounding square is 2x their area: not merged pairwise, nor collapsed at take().
-        assert_eq!(dirty.take().len(), 2);
+        // Their bounding square is 2x their area.
+        assert_eq!(take(&mut dirty).len(), 2);
+    }
+
+    #[test]
+    fn storage_stays_bounded_and_is_reused() {
+        let mut dirty = DirtyRegions::default();
+        for frame in 0..4u16 {
+            // Many more scattered tiles than the cap, as while frames are throttled.
+            for i in 0..2000u16 {
+                let x = (i % 200) * 128 + frame;
+                let y = (i / 200) * 128;
+                dirty.add(rect(x, y, x + 63, y + 63));
+                assert!(dirty.as_slice().len() <= MAX_PENDING_RECTS);
+            }
+            let capacity = dirty.rects.capacity();
+            dirty.clear();
+            assert!(dirty.as_slice().is_empty());
+            assert_eq!(dirty.rects.capacity(), capacity);
+        }
+        assert!(dirty.rects.capacity() <= 2 * (MAX_PENDING_RECTS + 1));
     }
 
     #[test]
@@ -263,7 +277,7 @@ mod tests {
             let x = i * 128;
             dirty.add(rect(x, 0, x + 63, 63));
         }
-        let taken = dirty.take();
+        let taken = take(&mut dirty);
         assert_eq!(taken.len(), 1);
         assert_eq!(
             taken[0],

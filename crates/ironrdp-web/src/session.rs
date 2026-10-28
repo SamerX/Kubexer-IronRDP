@@ -23,7 +23,6 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -45,8 +44,8 @@ use crate::canvas::{Canvas, RenderTarget};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
-use crate::frame::FrameScheduler;
-use crate::image::{extract_partial_image, extract_smallest_rectangle};
+use crate::frame::{DirtyRegions, FrameScheduler};
+use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
@@ -835,7 +834,7 @@ impl iron_remote_desktop::Session for Session {
                 }
                 _ = next_frame_tick(&mut frame_ticks).fuse() => {
                     if let Some(scheduler) = frame_scheduler.as_mut() {
-                        paint_regions(&gui, &image, scheduler.on_frame(), &mut draw_buffer)?;
+                        paint_regions(&mut gui, &image, scheduler.on_frame())?;
                     }
 
                     Vec::new()
@@ -1175,7 +1174,7 @@ impl iron_remote_desktop::Session for Session {
                         // Paint what is still pending from the current framebuffer before the resize clears the
                         // canvas and the reactivation replaces the framebuffer.
                         if let Some(scheduler) = frame_scheduler.as_mut() {
-                            paint_regions(&gui, &image, scheduler.take_pending(), &mut draw_buffer)?;
+                            paint_regions(&mut gui, &image, scheduler.pending())?;
                         }
 
                         // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
@@ -1265,7 +1264,7 @@ impl iron_remote_desktop::Session for Session {
         // Leave the last frame on screen, as an immediate paint would have. Dropping the scheduler
         // cancels its pending animation frame.
         if let Some(mut scheduler) = frame_scheduler.take()
-            && let Err(error) = paint_regions(&gui, &image, scheduler.take_pending(), &mut draw_buffer)
+            && let Err(error) = paint_regions(&mut gui, &image, scheduler.pending())
         {
             warn!(%error, "Failed to paint the final frame");
         }
@@ -1445,22 +1444,13 @@ async fn next_frame_tick(ticks: &mut Option<mpsc::UnboundedReceiver<()>>) {
     core::future::pending::<()>().await;
 }
 
-/// Paints the batched dirty `regions` from the current framebuffer, one `ImageData` per region.
-/// Regions are extracted exactly (never widened to whole rows): merged regions are often wide.
-fn paint_regions(
-    gui: &Canvas,
-    image: &DecodedImage,
-    regions: Vec<InclusiveRectangle>,
-    draw_buffer: &mut WriteBuf,
-) -> anyhow::Result<()> {
-    for region in regions {
-        let region = extract_smallest_rectangle(image, region, draw_buffer);
-        gui.draw(draw_buffer.filled_mut(), region)
-            .context("draw updated region")?;
-        draw_buffer.clear();
-    }
+/// Paints the batched dirty `regions` from the current framebuffer through the canvas's persistent
+/// backbuffer (no per-frame allocation), then clears them.
+fn paint_regions(gui: &mut Canvas, image: &DecodedImage, regions: &mut DirtyRegions) -> anyhow::Result<()> {
+    let painted = gui.paint(image, regions.as_slice());
+    regions.clear();
 
-    Ok(())
+    painted.context("draw updated regions")
 }
 
 fn into_object(val: JsValue) -> Result<js_sys::Object, IronError> {

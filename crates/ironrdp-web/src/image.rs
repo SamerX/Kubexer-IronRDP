@@ -19,9 +19,8 @@ pub(crate) fn extract_partial_image(
     }
 }
 
-/// Copies exactly the dirty `region` into `buffer`, one row at a time (never widened).
 // Faster for low-height and smaller images
-pub(crate) fn extract_smallest_rectangle(
+fn extract_smallest_rectangle(
     image: &DecodedImage,
     region: InclusiveRectangle,
     buffer: &mut WriteBuf,
@@ -83,5 +82,104 @@ fn extract_whole_rows(image: &DecodedImage, region: InclusiveRectangle, buffer: 
         top: region.top,
         right: image.width() - 1,
         bottom: region.bottom,
+    }
+}
+
+/// Clips `region` to a `width` x `height` surface; `None` when nothing of it is inside.
+pub(crate) fn clip_region(region: &InclusiveRectangle, width: u16, height: u16) -> Option<InclusiveRectangle> {
+    if width == 0
+        || height == 0
+        || region.left > region.right
+        || region.top > region.bottom
+        || region.left >= width
+        || region.top >= height
+    {
+        return None;
+    }
+
+    Some(InclusiveRectangle {
+        left: region.left,
+        top: region.top,
+        right: region.right.min(width - 1),
+        bottom: region.bottom.min(height - 1),
+    })
+}
+
+/// Copies exactly `region` of the framebuffer into `dst` (tightly packed rows, `dst.len()` must be
+/// `region.width() * region.height() * 4`), forcing alpha opaque in the same pass. The framebuffer
+/// isn't guaranteed opaque (zero-init columns, QOI-RGBA) and `put_image_data` stores alpha
+/// verbatim. `region` must lie inside the framebuffer (see [`clip_region`]).
+pub(crate) fn copy_region_opaque(image: &DecodedImage, region: &InclusiveRectangle, dst: &mut [u8]) {
+    debug_assert_eq!(image.bytes_per_pixel(), 4);
+
+    let stride = image.stride();
+    let row_begin = usize::from(region.left) * 4;
+    let row_len = usize::from(region.width()) * 4;
+    debug_assert_eq!(dst.len(), row_len * usize::from(region.height()));
+
+    let src = image.data();
+    let src_rows = src[usize::from(region.top) * stride..].chunks(stride);
+
+    for (dst_row, src_row) in dst.chunks_exact_mut(row_len).zip(src_rows) {
+        dst_row.copy_from_slice(&src_row[row_begin..row_begin + row_len]);
+        for pixel in dst_row.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp::graphics::image_processing::PixelFormat;
+
+    use super::*;
+
+    fn rect(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn clip_region_bounds() {
+        assert_eq!(clip_region(&rect(0, 0, 9, 9), 10, 10), Some(rect(0, 0, 9, 9)));
+        assert_eq!(clip_region(&rect(5, 5, 20, 30), 10, 10), Some(rect(5, 5, 9, 9)));
+        assert_eq!(clip_region(&rect(10, 0, 12, 3), 10, 10), None);
+        assert_eq!(clip_region(&rect(0, 10, 3, 12), 10, 10), None);
+        assert_eq!(clip_region(&rect(0, 0, 3, 3), 0, 10), None);
+    }
+
+    #[test]
+    fn copy_region_opaque_packs_the_region_and_forces_alpha() {
+        // Zero-initialized framebuffer: alpha is 0 everywhere.
+        let image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
+        let region = rect(1, 1, 2, 2);
+        let mut dst = vec![0x11u8; 2 * 2 * 4];
+
+        copy_region_opaque(&image, &region, &mut dst);
+
+        for pixel in dst.chunks_exact(4) {
+            assert_eq!(pixel, [0, 0, 0, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn copy_region_opaque_matches_extract_smallest_rectangle() {
+        let image = DecodedImage::new(PixelFormat::RgbA32, 64, 32);
+        let region = rect(5, 7, 40, 30);
+        let mut extracted = WriteBuf::new();
+        extract_smallest_rectangle(&image, region.clone(), &mut extracted);
+        let mut expected = extracted.filled().to_vec();
+        for pixel in expected.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+
+        let mut dst = vec![0u8; expected.len()];
+        copy_region_opaque(&image, &region, &mut dst);
+
+        assert_eq!(dst, expected);
     }
 }
